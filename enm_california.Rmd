@@ -1,0 +1,294 @@
+---
+title: "Predicting Habitat Suitability and Niche Overlap in California Endemics"
+author: "Spatial Data Exploration"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+# Global options for the code chunks
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Executive Summary
+
+Ecological Niche Modeling (ENM) is a powerful spatial analysis tool used to understand the environmental drivers of species distributions. This project investigates the climatic niches of two California endemic species: the threatened California red-legged frog (Rana draytonii) and the historically extirpated California grizzly bear (Ursus arctos californicus).
+
+By combining species occurrence records with spatial climate data, this analysis utilizes Generalized Linear Models (GLMs) and Bioclimatic envelope modeling to predict habitat suitability, project ranges under future climate scenarios (2070), and quantify historical niche overlap.
+
+# 1. Environment Setup and Data Ingestion
+
+This project utilizes the modern spatial R stack: sf for high-performance vector geometries and terra for rapid raster processing. We also use tigris and geodata to dynamically fetch highly accurate, reproducible administrative boundaries and climate data via APIs.
+
+```{r load-libraries}
+# Load modern spatial libraries
+library(sf)
+library(terra)
+library(dismo)
+library(tigris)  # For dynamic boundary data
+library(geodata) # For dynamic WorldClim climate data
+library(corrplot) # For EDA visualization
+library(usdm)     # For automated collinearity filtering
+```
+
+We ingest the species occurrence points, convert them into spatial objects, and establish our study area boundary.
+
+```{r boundary-data}
+# Fetch California county boundaries dynamically 
+options(tigris_use_cache = TRUE)
+counties <- counties(state = "CA", cb = TRUE, class = "sf", progress_bar = FALSE)
+counties <- st_transform(counties, crs = 4326)
+
+# Load CRLF occurrence points and convert to spatial sf object
+CRLF.df <- read.csv("Rana_draytonii.csv")
+CRLF.occ <- st_as_sf(CRLF.df, coords = c("longitude", "latitude"), crs = 4326)
+
+# Visualize the baseline occurrences
+plot(st_geometry(counties), border = "gray50", main = "CRLF Occurrences in California")
+plot(st_geometry(CRLF.occ), pch = 21, bg = "blue", add = TRUE)
+```
+
+# 2. Background Sampling & Environmental Covariates
+
+Predictive models require both presence and absence data to establish constraints. We generate random pseudo-absence (background) points across California using native sf sampling.
+
+```{r absence-points}
+set.seed(123)
+CRLF.abs <- st_sample(counties, size = nrow(CRLF.occ), type = "random")
+
+plot(st_geometry(counties), border = "gray50", main = "CRLF Presences (Blue) and Pseudo-Absences (Red)")
+plot(st_geometry(CRLF.occ), pch = 21, bg = "blue", add = TRUE)
+plot(CRLF.abs, pch = 21, bg = "red", add = TRUE)
+```
+
+We extract 19 continuous environmental covariates from the WorldClim database to serve as our initial model predictors.
+
+```{r load-rasters}
+# Dynamically download present-day WorldClim bioclimatic variables
+wclim_global <- worldclim_global(var = "bio", res = 2.5, path = tempdir())
+names(wclim_global) <- paste0("bio", 1:19)
+
+# Mask and crop the global raster stack to the California boundary
+wclim <- mask(crop(wclim_global, vect(counties)), vect(counties))
+```
+
+In this case, rather than modeling all 19 variables, we subset to 6 which are ecologically relevant:
+
+-   bio1: Annual Mean Temperature
+-   bio2: Mean Diurnal Temperature Range
+-   bio7: Annual Temperature Range
+-   bio12: Annual Precipitation
+-   bio15: Precipitation Seasonality
+-   bio16: Precipitation of Wettest Quarter
+
+```{r raster-selection}
+# A Priori Variable Selection:
+
+# predictors driving amphibian and mammal distribution (temperature limits & precipitation constraints).
+wclim <- subset(wclim, c("bio1", "bio2", "bio7", "bio12", "bio15", "bio16"))
+
+# Extract raster values at our presence and absence locations
+env.pres <- terra::extract(wclim, vect(CRLF.occ), ID = FALSE)
+env.abs <- terra::extract(wclim, vect(CRLF.abs), ID = FALSE)
+
+# Construct a unified modeling dataframe 
+env.pres$occ <- 1
+env.abs$occ <- 0
+env <- rbind(env.pres, env.abs)
+```
+
+# 3. Exploratory Data Analysis: Assessing Collinearity
+
+While our initial 6 variables are ecologically justified, feeding highly correlated predictors into a Generalized Linear Model (GLM) inflates variance and causes multicollinearity. We first visualize the correlation matrix across our selected variables.
+
+```{r ENM}
+# Calculate the correlation matrix (excluding the 'occ' presence/absence column)
+cor_matrix <- cor(env[ , -which(names(env) == "occ")])
+
+# Plot a professional heatmap
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.cex = 1, diag = FALSE,
+         addCoef.col = "black", # This adds the actual correlation numbers to the squares!
+         title = "Bioclimatic Variable Correlation Matrix",
+         mar = c(0,0,1,0))
+```
+
+## Finding
+
+The correlation heatmap reveals a significant relationship between Temperature Annual Range (bio7) and Precipitation Seasonality (bio15). This suggests that in the California study area, regions with the highest annual temperature swings also experience the highest levels of rainfall variability. To prevent this redundancy from biasing the model, the VIF algorithm will evaluate which of these variables holds more unique predictive power and drop the other.
+
+## Automated Variable Selection (VIF)
+
+To ensure a parsimonious model devoid of human bias, we utilize the Variance Inflation Factor (VIF) algorithm from the usdm package. We set a strict correlation threshold of 0.7 to iteratively filter redundant variables from our ecologically informed subset.
+
+```{r feature-selection}
+# Identify highly correlated variables and flag them for removal
+vif_results <- vifcor(wclim, th = 0.7)
+
+# Extract the names of the statistically safe variables
+safe_vars <- vif_results@results$Variables
+cat("Uncorrelated variables dynamically selected for modeling:\n", paste(safe_vars, collapse = ", "))
+
+# Automatically subset our raster stack and dataframe to ONLY include these safe variables
+wclim <- usdm::exclude(wclim, vif_results)
+env <- env[ , c("occ", safe_vars)]
+```
+
+While Precipitation of the Wettest Quarter (bio16) is a known driver for amphibians, its high collinearity with Annual Precipitation (bio12) in California necessitated its removal to ensure model parsimony. Bio12 was retained as a more comprehensive metric of total water availability.
+
+# 4. Habitat Suitability Modeling (GLM)
+
+We formulate a Generalized Linear Model (GLM) to determine how our statistically refined suite of bioclimatic variables influences the probability of occurrence.
+
+```{r GLM}
+# Dynamically construct the GLM formula using our safe variables
+glm_formula <- as.formula(paste("occ ~", paste(safe_vars, collapse = " + ")))
+
+# Fit the optimized Generalized Linear Model 
+CRLF.enm <- glm(glm_formula, family = binomial(link = "logit"), data = env)
+summary(CRLF.enm)
+```
+
+## Model Evaluation
+
+We evaluate model performance using Receiver Operating Characteristic (ROC) metrics.
+
+```{r evaluate}
+# Isolate the predictor variables for dismo evaluation
+eval <- evaluate(p = env.pres[ , safe_vars], 
+                 a = env.abs[ , safe_vars], 
+                 model = CRLF.enm)
+
+# Plot ROC curve
+plot(eval, 'ROC', main = "ROC Curve: CRLF GLM")
+```
+
+Finding: The ROC curve sits well above the null expectation line, indicating a high true positive rate and strong predictive performance.
+
+## Spatial Prediction
+
+Projecting the model back onto the geographic space allows us to visualize the continuous habitat suitability.
+
+```{r prediction}
+# Generate spatial prediction 
+enm.pred <- predict(wclim, CRLF.enm, type = "response")
+
+# Plot the suitability map
+plot(enm.pred, col = terrain.colors(100, rev = TRUE), main = "Predicted Habitat Suitability for CRLF")
+```
+
+## Finding
+
+The Generalized Linear Model (GLM) identifies Precipitation Seasonality (bio15) as the primary environmental constraint for the California red-legged frog (p \< 0.001).
+
+-   Ecological Specialization: The strong positive relationship with (bio15() suggests that the species is a specialist of California’s Mediterranean climate. Its lifecycle is finely tuned to the timing of concentrated winter rainfall, which appears to be more critical for the maintenance of breeding pools than the Annual Precipitation (bio12) total itself.
+
+-   Thermal Buffering: The model indicates a preference for regions with a lower Mean Diurnal Range (bio2), highlighting the importance of coastal marine layers in buffering the species from the extreme daily temperature fluctuations found further inland.
+
+-   Spatial Prediction: The high-suitability areas are geographically concentrated along the Central Coast and Bay Area corridors. This spatial distribution confirms that the species' niche is defined by a narrow intersection of stable temperatures and highly seasonal hydrological cycles.
+
+# 5. Modeling the California Grizzly and Climate Change (Bioclim)
+
+We apply a similar workflow to the historically extirpated California grizzly bear using a Bioclimatic envelope model (Bioclim). To ensure mathematical consistency across the project, the bear model is restricted to the exact same safe_vars established during the VIF analysis.
+
+```{r grizzly}
+# Load occurrence points 
+grizzly.df <- read.csv("Ursus_arctos_californicus.csv")
+grizzly.occ <- st_as_sf(grizzly.df, coords = c("longitude", "latitude"), crs = 4326)
+
+# Extract environmental values at grizzly locations using the VIF-filtered raster stack
+grizzly_matrix <- terra::extract(wclim, vect(grizzly.occ), ID = FALSE)
+
+# Fit the Bioclim ENM
+grizzly.bc.enm <- bioclim(grizzly_matrix)
+
+# Predict current spatial suitability
+grizzly.bc.pred <- predict(wclim, grizzly.bc.enm)
+plot(grizzly.bc.pred, col = terrain.colors(100, rev = TRUE), 
+     main = "Current Habitat Suitability for U. a. californicus")
+```
+
+## Climate Change Projection (2070)
+
+We project the Grizzly Bioclim model onto forecasted WorldClim data for the year 2070.
+
+```{r future-climate-2070}
+# Download future climate projections (CMIP6) for the year 2070
+wclim2070_global <- cmip6_world(model = "MPI-ESM1-2-HR", ssp = "245", time = "2061-2080", 
+                                var = "bioc", res = 2.5, path = tempdir())
+names(wclim2070_global) <- paste0("bio", 1:19)
+
+# Crop and mask to the California boundary
+wclim2070 <- mask(crop(wclim2070_global, vect(counties)), vect(counties))
+
+# CRITICAL: Subset the 2070 raster stack to perfectly match our 4 VIF-selected variables
+wclim2070 <- subset(wclim2070, safe_vars)
+
+# Project the model into the future
+grizzly.bc.2070 <- predict(wclim2070, grizzly.bc.enm)
+
+# Compare Present vs. Future distributions
+par(mfrow = c(1, 2))
+plot(grizzly.bc.pred, col = terrain.colors(100, rev = TRUE), main = "Suitability (Present)")
+plot(grizzly.bc.2070, col = terrain.colors(100, rev = TRUE), main = "Suitability (2070)")
+```
+
+## Finding:
+
+Projecting the Bioclim model into the year 2070 reveals a significant geographic contraction and northward shift of suitable environmental conditions for the California grizzly bear. Under future climate scenarios, the distribution of viable environmental conditions for the California grizzly narrows significantly.
+
+# 6. Testing Environmental Niche Overlap
+
+To quantify how similar the environmental niches of the frog and the bear are, we calculate Schoener's D statistic.
+
+```{r niche-overlap}
+# Generate a Bioclim prediction for the CRLF for direct comparison
+CRLF.bc.enm <- bioclim(env.pres[ , safe_vars])
+CRLF.bc.pred <- predict(wclim, CRLF.bc.enm)
+
+# Convert rasters and measure overlap 
+library(raster)
+D.obs <- nicheOverlap(raster(CRLF.bc.pred), raster(grizzly.bc.pred), stat = "D")
+cat("Observed Schoener's D:", D.obs, "\n")
+```
+
+We generate a null distribution via random permutations within their respective spatial convex hulls to test significance.
+
+```{r spatial-extent}
+# Generate spatial extents natively with sf
+CRLF.range <- st_convex_hull(st_union(CRLF.occ))
+grizzly.range <- st_convex_hull(st_union(grizzly.occ))
+
+# Permutation test (n = 50 iterations)
+set.seed(789)
+D.null <- numeric(50) 
+
+for (i in 1:50) {
+  CRLF.hull <- st_sample(CRLF.range, size = 50, type = "random")
+  grizzly.hull <- st_sample(grizzly.range, size = 50, type = "random")
+  
+  CRLF.enm.null <- bioclim(terra::extract(wclim, vect(CRLF.hull), ID = FALSE))
+  grizzly.enm.null <- bioclim(terra::extract(wclim, vect(grizzly.hull), ID = FALSE))
+  
+  CRLF.pred.null <- predict(wclim, CRLF.enm.null)
+  grizzly.pred.null <- predict(wclim, grizzly.enm.null)
+  
+  D.null[i] <- nicheOverlap(raster(CRLF.pred.null), raster(grizzly.pred.null), stat = "D")
+}
+
+# Plot the null distribution against the observed overlap
+par(mfrow = c(1, 1))
+hist(D.null, main = "Niche Overlap vs Null Geographic Background", 
+     xlim = c(0, 1), xlab = "Schoener's D")
+abline(v = D.obs, col = "blue", lwd = 3)
+```
+
+# Conclusion
+
+The spatial analysis revealed that the niche overlap between the California grizzly bear and the California red-legged frog (indicated by the blue line) is significantly less than expected by chance.
+
+While both species are endemic to California, their distributions are driven by fundamentally different abiotic factors.
